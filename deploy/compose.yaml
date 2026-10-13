@@ -1,0 +1,30 @@
+services:
+  api:
+    build: ../server
+    restart: unless-stopped
+    environment:
+      DATABASE_PATH: /data/gym-partner.sqlite
+      PORT: 3000
+      ADMIN_TOKEN: ${ADMIN_TOKEN:?Set ADMIN_TOKEN in deploy/.env}
+    volumes:
+      - gp-data:/data
+    expose:
+      - "3000"
+  proxy:
+    image: caddy:2
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      API_DOMAIN: ${API_DOMAIN:?Set API_DOMAIN in deploy/.env}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      - api
+volumes:
+  gp-data:
+  caddy-data:
+  caddy-config:
