@@ -73,7 +73,7 @@ Caddy 自动申请 HTTPS 证书。放行服务器的80/443端口。SQLite 数据
 
 ## GitHub
 
-目标仓库：https://github.com/hezhouyu8-crypto/gym-partner 。仓库已创建，当前 GitHub 集成写入请求返回403，需解决内容写权限后上传。CI 配置已备好，仓库根目录应为此目录。不要发密码或访问令牌。
+目标仓库：https://github.com/hezhouyu8-crypto/gym-partner 。仓库已创建；连接器内容写入权限受限，使用已登录的 GitHub 网页上传代码。CI 配置已备好，仓库根目录应为此目录。不要发密码或访问令牌。
 
 ## 举报运营
 
