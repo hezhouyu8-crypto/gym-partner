@@ -1,0 +1,52 @@
+import express from 'express';
+import Database from 'better-sqlite3';
+import helmet from 'helmet';
+import cors from 'cors';
+import rateLimit from 'express-rate-limit';
+import { randomBytes, randomUUID, scryptSync, timingSafeEqual } from 'node:crypto';
+import { pathToFileURL } from 'node:url';
+const parts=['胸部','背部','肩部','腿部','臀部','二头肌','三头肌','核心','全身'];
+const hash=(password,salt)=>scryptSync(password,salt,64).toString('hex');
+export function createApp(file='gym-partner.sqlite') {
+ const db=new Database(file); db.pragma('journal_mode = WAL'); db.pragma('foreign_keys = ON');
+ db.exec(`CREATE TABLE IF NOT EXISTS users(id TEXT PRIMARY KEY,email TEXT UNIQUE NOT NULL,password TEXT NOT NULL,salt TEXT NOT NULL,name TEXT NOT NULL,city TEXT NOT NULL);
+ CREATE TABLE IF NOT EXISTS sessions(token TEXT PRIMARY KEY,user_id TEXT REFERENCES users(id) ON DELETE CASCADE,expires INTEGER NOT NULL);
+ CREATE TABLE IF NOT EXISTS workouts(id TEXT PRIMARY KEY,user_id TEXT REFERENCES users(id) ON DELETE CASCADE,venue TEXT NOT NULL,city TEXT NOT NULL,parts TEXT NOT NULL,starts TEXT NOT NULL,note TEXT NOT NULL);
+ CREATE TABLE IF NOT EXISTS invites(id TEXT PRIMARY KEY,workout_id TEXT REFERENCES workouts(id) ON DELETE CASCADE,sender TEXT REFERENCES users(id) ON DELETE CASCADE,receiver TEXT REFERENCES users(id) ON DELETE CASCADE,status TEXT NOT NULL,UNIQUE(workout_id,sender));
+ CREATE TABLE IF NOT EXISTS messages(id TEXT PRIMARY KEY,invite_id TEXT REFERENCES invites(id) ON DELETE CASCADE,user_id TEXT REFERENCES users(id) ON DELETE CASCADE,body TEXT NOT NULL,created TEXT NOT NULL);
+ CREATE TABLE IF NOT EXISTS blocks(user_id TEXT REFERENCES users(id) ON DELETE CASCADE,target TEXT REFERENCES users(id) ON DELETE CASCADE,PRIMARY KEY(user_id,target));
+ CREATE TABLE IF NOT EXISTS reports(id TEXT PRIMARY KEY,user_id TEXT REFERENCES users(id) ON DELETE CASCADE,target TEXT REFERENCES users(id) ON DELETE CASCADE,reason TEXT NOT NULL,created TEXT NOT NULL);`);
+ if(!db.prepare('PRAGMA table_info(users)').all().some(c=>c.name==='suspended'))db.exec('ALTER TABLE users ADD COLUMN suspended INTEGER NOT NULL DEFAULT 0');
+ const app=express();app.disable('x-powered-by');app.use(helmet());app.use(cors({origin:process.env.WEB_ORIGIN?process.env.WEB_ORIGIN.split(','):false}));app.use(express.json({limit:'16kb'}));
+ const fail=(msg,status=400)=>{const e=new Error(msg);e.status=status;throw e;};
+ const text=(v,min,max,label)=>{if(typeof v!=='string'||v.trim().length<min||v.trim().length>max)fail(label+'格式不正确');return v.trim();};
+ const blocked=(a,b)=>!!db.prepare('SELECT 1 FROM blocks WHERE (user_id=? AND target=?) OR (user_id=? AND target=?)').get(a,b,b,a);
+ const publicUser=u=>({id:u.id,name:u.name,city:u.city});
+ function auth(req,res,next){const token=req.headers.authorization?.replace(/^Bearer /,'');const row=db.prepare('SELECT users.* FROM sessions JOIN users ON users.id=sessions.user_id WHERE token=? AND expires>? AND users.suspended=0').get(token||'',Date.now());if(!row)return res.status(401).json({error:'请重新登录'});req.user=row;req.token=token;next();}
+ const session=u=>{const token=randomBytes(32).toString('hex');db.prepare('INSERT INTO sessions VALUES(?,?,?)').run(token,u.id,Date.now()+30*86400000);return{token,user:publicUser(u)};};
+ app.get('/health',(_,res)=>res.json({ok:true}));
+ app.use('/auth',rateLimit({windowMs:15*60000,limit:30,standardHeaders:true,legacyHeaders:false}));
+ app.post('/auth/signup',(req,res)=>{const email=text(req.body.email,3,254,'邮箱').toLowerCase();if(!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))fail('请输入有效邮箱');const password=text(req.body.password,10,128,'密码（至少10位）');const name=text(req.body.name,1,30,'昵称');const city=text(req.body.city,1,50,'城市');if(db.prepare('SELECT 1 FROM users WHERE email=?').get(email))fail('该邮箱已注册',409);const id=randomUUID(),salt=randomBytes(16).toString('hex');db.prepare('INSERT INTO users(id,email,password,salt,name,city) VALUES(?,?,?,?,?,?)').run(id,email,hash(password,salt),salt,name,city);res.status(201).json(session({id,name,city}));});
+ app.post('/auth/login',(req,res)=>{const email=text(req.body.email,3,254,'邮箱').toLowerCase();const password=text(req.body.password,1,128,'密码');const u=db.prepare('SELECT * FROM users WHERE email=?').get(email);const salt=u?.salt||'dummy';const digest=hash(password,salt);if(!u||u.suspended||!timingSafeEqual(Buffer.from(digest,'hex'),Buffer.from(u.password,'hex')))fail('邮箱或密码错误',401);res.json(session(u));});
+ const admin=(req,res,next)=>{const expected=process.env.ADMIN_TOKEN;const actual=req.headers['x-admin-token'];if(!expected||expected.length<32||typeof actual!=='string'||Buffer.byteLength(actual)!==Buffer.byteLength(expected)||!timingSafeEqual(Buffer.from(actual),Buffer.from(expected)))return res.status(403).json({error:'无管理员权限'});next();};
+ app.get('/admin/reports',admin,(_,res)=>res.json(db.prepare('SELECT reports.*,users.name FROM reports JOIN users ON users.id=reports.target ORDER BY created DESC LIMIT 200').all()));
+ app.post('/admin/users/:id/suspend',admin,(req,res)=>{const result=db.prepare('UPDATE users SET suspended=1 WHERE id=?').run(req.params.id);if(!result.changes)fail('用户不存在',404);db.prepare('DELETE FROM sessions WHERE user_id=?').run(req.params.id);res.json({ok:true});});
+ app.use(auth);app.use(rateLimit({windowMs:60000,limit:120,standardHeaders:true,legacyHeaders:false}));
+ app.get('/me',(req,res)=>res.json(publicUser(req.user)));
+ app.post('/auth/logout',(req,res)=>{db.prepare('DELETE FROM sessions WHERE token=?').run(req.token);res.json({ok:true});});
+ app.delete('/me',(req,res)=>{db.prepare('DELETE FROM users WHERE id=?').run(req.user.id);res.json({ok:true});});
+ app.get('/workouts',(req,res)=>{const city=typeof req.query.city==='string'?req.query.city:req.user.city;const rows=db.prepare(`SELECT w.*,u.name FROM workouts w JOIN users u ON u.id=w.user_id WHERE u.suspended=0 AND w.city=? AND w.starts>? ORDER BY w.starts LIMIT 100`).all(city,new Date().toISOString()).filter(w=>!blocked(req.user.id,w.user_id));res.json(rows.map(w=>({...w,parts:JSON.parse(w.parts)})));});
+ app.post('/workouts',(req,res)=>{const venue=text(req.body.venue,2,100,'场馆');const city=text(req.body.city,1,50,'城市');const note=text(req.body.note||'一起训练',1,300,'备注');if(!Array.isArray(req.body.parts)||!req.body.parts.length||req.body.parts.length>5||req.body.parts.some(p=>!parts.includes(p)))fail('请选择有效训练部位');const date=new Date(req.body.starts);if(!Number.isFinite(date.getTime())||date.getTime()<=Date.now()||date.getTime()>Date.now()+30*86400000)fail('训练时间应在未来30天内');const id=randomUUID();db.prepare('INSERT INTO workouts VALUES(?,?,?,?,?,?,?)').run(id,req.user.id,venue,city,JSON.stringify([...new Set(req.body.parts)]),date.toISOString(),note);res.status(201).json({id});});
+ app.delete('/workouts/:id',(req,res)=>{const result=db.prepare('DELETE FROM workouts WHERE id=? AND user_id=?').run(req.params.id,req.user.id);if(!result.changes)fail('训练不存在',404);res.json({ok:true});});
+ app.post('/invites',(req,res)=>{const w=db.prepare('SELECT * FROM workouts WHERE id=?').get(req.body.workoutId);if(!w||w.starts<=new Date().toISOString())fail('该训练已结束或不存在',404);if(w.user_id===req.user.id)fail('不能邀请自己');if(db.prepare('SELECT suspended FROM users WHERE id=?').get(w.user_id)?.suspended)fail('用户不可用',403);if(blocked(req.user.id,w.user_id))fail('无法发出邀约',403);if(db.prepare('SELECT 1 FROM invites WHERE workout_id=? AND sender=?').get(w.id,req.user.id))fail('已经发出过邀约',409);const id=randomUUID();db.prepare('INSERT INTO invites VALUES(?,?,?,?,?)').run(id,w.id,req.user.id,w.user_id,'pending');res.status(201).json({id});});
+ app.get('/invites',(req,res)=>{res.json(db.prepare(`SELECT i.*,w.venue,w.parts,w.starts,w.note,s.name AS sender_name,r.name AS receiver_name FROM invites i JOIN workouts w ON w.id=i.workout_id JOIN users s ON s.id=i.sender JOIN users r ON r.id=i.receiver WHERE i.sender=? OR i.receiver=? ORDER BY w.starts`).all(req.user.id,req.user.id).filter(i=>!blocked(i.sender,i.receiver)).map(i=>({...i,parts:JSON.parse(i.parts)})));});
+ const invite=(req,id)=>{const i=db.prepare('SELECT * FROM invites WHERE id=?').get(id);if(!i||![i.sender,i.receiver].includes(req.user.id))fail('邀约不存在',404);if(db.prepare('SELECT 1 FROM users WHERE id IN (?,?) AND suspended=1').get(i.sender,i.receiver))fail('用户不可用',403);if(blocked(i.sender,i.receiver))fail('无法访问该邀约',403);return i;};
+ app.patch('/invites/:id',(req,res)=>{const i=invite(req,req.params.id),status=req.body.status;if(status==='cancelled'){if(!['pending','accepted'].includes(i.status))fail('邀约已经结束');}else if(['accepted','declined'].includes(status)){if(i.receiver!==req.user.id||i.status!=='pending')fail('不能更改该邀约',403);const w=db.prepare('SELECT starts FROM workouts WHERE id=?').get(i.workout_id);if(w.starts<=new Date().toISOString())fail('训练已过期');}else fail('无效状态');db.prepare('UPDATE invites SET status=? WHERE id=?').run(status,i.id);res.json({ok:true});});
+ app.get('/invites/:id/messages',(req,res)=>{invite(req,req.params.id);res.json(db.prepare('SELECT m.*,u.name FROM messages m JOIN users u ON u.id=m.user_id WHERE invite_id=? ORDER BY created LIMIT 300').all(req.params.id));});
+ app.post('/invites/:id/messages',(req,res)=>{const i=invite(req,req.params.id);if(i.status!=='accepted')fail('对方接受约练后才能聊天',403);const body=text(req.body.body,1,1000,'消息');const id=randomUUID();db.prepare('INSERT INTO messages VALUES(?,?,?,?,?)').run(id,i.id,req.user.id,body,new Date().toISOString());res.status(201).json({id});});
+ app.post('/blocks',(req,res)=>{if(req.body.target===req.user.id||!db.prepare('SELECT 1 FROM users WHERE id=?').get(req.body.target))fail('无效用户');db.prepare('INSERT OR IGNORE INTO blocks VALUES(?,?)').run(req.user.id,req.body.target);res.json({ok:true});});
+ app.post('/reports',(req,res)=>{if(req.body.target===req.user.id||!db.prepare('SELECT 1 FROM users WHERE id=?').get(req.body.target))fail('无效用户');const reason=text(req.body.reason,3,500,'举报原因');db.prepare('INSERT INTO reports VALUES(?,?,?,?,?)').run(randomUUID(),req.user.id,req.body.target,reason,new Date().toISOString());res.status(201).json({ok:true});});
+ app.use((err,req,res,next)=>{if(!err.status)console.error(err);res.status(err.status||500).json({error:err.status?err.message:'服务暂时不可用'});});
+ return {app,db};
+}
+if(process.argv[1]&&import.meta.url===pathToFileURL(process.argv[1]).href){const {app}=createApp(process.env.DATABASE_PATH);app.listen(Number(process.env.PORT)||3000,'0.0.0.0',()=>console.log('gym partner API ready'));}
