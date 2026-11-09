@@ -7,7 +7,8 @@ import { randomBytes, randomUUID, scryptSync, timingSafeEqual } from 'node:crypt
 import { pathToFileURL } from 'node:url';
 const parts=['胸部','背部','肩部','腿部','臀部','二头肌','三头肌','核心','全身'];
 const hash=(password,salt)=>scryptSync(password,salt,64).toString('hex');
-export function createApp(file='gym-partner.sqlite') {
+export function createApp(file='gym-partner.sqlite', {trustProxyHops=process.env.TRUST_PROXY_HOPS||'0'}={}) {
+ if(!/^[01]$/.test(String(trustProxyHops)))throw new Error('TRUST_PROXY_HOPS must be 0 or 1');
  const db=new Database(file); db.pragma('journal_mode = WAL'); db.pragma('foreign_keys = ON');
  db.exec(`CREATE TABLE IF NOT EXISTS users(id TEXT PRIMARY KEY,email TEXT UNIQUE NOT NULL,password TEXT NOT NULL,salt TEXT NOT NULL,name TEXT NOT NULL,city TEXT NOT NULL);
  CREATE TABLE IF NOT EXISTS sessions(token TEXT PRIMARY KEY,user_id TEXT REFERENCES users(id) ON DELETE CASCADE,expires INTEGER NOT NULL);
@@ -17,7 +18,7 @@ export function createApp(file='gym-partner.sqlite') {
  CREATE TABLE IF NOT EXISTS blocks(user_id TEXT REFERENCES users(id) ON DELETE CASCADE,target TEXT REFERENCES users(id) ON DELETE CASCADE,PRIMARY KEY(user_id,target));
  CREATE TABLE IF NOT EXISTS reports(id TEXT PRIMARY KEY,user_id TEXT REFERENCES users(id) ON DELETE CASCADE,target TEXT REFERENCES users(id) ON DELETE CASCADE,reason TEXT NOT NULL,created TEXT NOT NULL);`);
  if(!db.prepare('PRAGMA table_info(users)').all().some(c=>c.name==='suspended'))db.exec('ALTER TABLE users ADD COLUMN suspended INTEGER NOT NULL DEFAULT 0');
- const app=express();app.disable('x-powered-by');app.use(helmet());app.use(cors({origin:process.env.WEB_ORIGIN?process.env.WEB_ORIGIN.split(','):false}));app.use(express.json({limit:'16kb'}));
+ const app=express();app.set('trust proxy',Number(trustProxyHops));app.disable('x-powered-by');app.use(helmet());app.use(cors({origin:process.env.WEB_ORIGIN?process.env.WEB_ORIGIN.split(','):false}));app.use(express.json({limit:'16kb'}));
  const fail=(msg,status=400)=>{const e=new Error(msg);e.status=status;throw e;};
  const text=(v,min,max,label)=>{if(typeof v!=='string'||v.trim().length<min||v.trim().length>max)fail(label+'格式不正确');return v.trim();};
  const blocked=(a,b)=>!!db.prepare('SELECT 1 FROM blocks WHERE (user_id=? AND target=?) OR (user_id=? AND target=?)').get(a,b,b,a);
@@ -42,7 +43,7 @@ export function createApp(file='gym-partner.sqlite') {
  app.get('/invites',(req,res)=>{res.json(db.prepare(`SELECT i.*,w.venue,w.parts,w.starts,w.note,s.name AS sender_name,r.name AS receiver_name FROM invites i JOIN workouts w ON w.id=i.workout_id JOIN users s ON s.id=i.sender JOIN users r ON r.id=i.receiver WHERE i.sender=? OR i.receiver=? ORDER BY w.starts`).all(req.user.id,req.user.id).filter(i=>!blocked(i.sender,i.receiver)).map(i=>({...i,parts:JSON.parse(i.parts)})));});
  const invite=(req,id)=>{const i=db.prepare('SELECT * FROM invites WHERE id=?').get(id);if(!i||![i.sender,i.receiver].includes(req.user.id))fail('邀约不存在',404);if(db.prepare('SELECT 1 FROM users WHERE id IN (?,?) AND suspended=1').get(i.sender,i.receiver))fail('用户不可用',403);if(blocked(i.sender,i.receiver))fail('无法访问该邀约',403);return i;};
  app.patch('/invites/:id',(req,res)=>{const i=invite(req,req.params.id),status=req.body.status;if(status==='cancelled'){if(!['pending','accepted'].includes(i.status))fail('邀约已经结束');}else if(['accepted','declined'].includes(status)){if(i.receiver!==req.user.id||i.status!=='pending')fail('不能更改该邀约',403);const w=db.prepare('SELECT starts FROM workouts WHERE id=?').get(i.workout_id);if(w.starts<=new Date().toISOString())fail('训练已过期');}else fail('无效状态');db.prepare('UPDATE invites SET status=? WHERE id=?').run(status,i.id);res.json({ok:true});});
- app.get('/invites/:id/messages',(req,res)=>{invite(req,req.params.id);res.json(db.prepare('SELECT m.*,u.name FROM messages m JOIN users u ON u.id=m.user_id WHERE invite_id=? ORDER BY created LIMIT 300').all(req.params.id));});
+ app.get('/invites/:id/messages',(req,res)=>{invite(req,req.params.id);res.json(db.prepare('SELECT m.*,u.name FROM messages m JOIN users u ON u.id=m.user_id WHERE invite_id=? ORDER BY m.created DESC,m.rowid DESC LIMIT 300').all(req.params.id).reverse());});
  app.post('/invites/:id/messages',(req,res)=>{const i=invite(req,req.params.id);if(i.status!=='accepted')fail('对方接受约练后才能聊天',403);const body=text(req.body.body,1,1000,'消息');const id=randomUUID();db.prepare('INSERT INTO messages VALUES(?,?,?,?,?)').run(id,i.id,req.user.id,body,new Date().toISOString());res.status(201).json({id});});
  app.post('/blocks',(req,res)=>{if(req.body.target===req.user.id||!db.prepare('SELECT 1 FROM users WHERE id=?').get(req.body.target))fail('无效用户');db.prepare('INSERT OR IGNORE INTO blocks VALUES(?,?)').run(req.user.id,req.body.target);res.json({ok:true});});
  app.post('/reports',(req,res)=>{if(req.body.target===req.user.id||!db.prepare('SELECT 1 FROM users WHERE id=?').get(req.body.target))fail('无效用户');const reason=text(req.body.reason,3,500,'举报原因');db.prepare('INSERT INTO reports VALUES(?,?,?,?,?)').run(randomUUID(),req.user.id,req.body.target,reason,new Date().toISOString());res.status(201).json({ok:true});});
