@@ -8,3 +8,5 @@ dist/
 *.jks
 *.keystore
 credentials.json
+
+project.private.config.json
