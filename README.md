@@ -49,6 +49,8 @@ cp .env.example .env
  docker compose up -d --build
 ```
 
+Compose 已设置 `TRUST_PROXY_HOPS=1`，让登录限流按 Caddy 转发的客户端地址分别计数；API 的3000端口仅在内部网络开放。直接运行 API 时默认不信任代理头，只有使用这套单层代理拓扑时才设置为1。
+
 Caddy 自动申请 HTTPS 证书。放行服务器的80/443端口。SQLite 数据保存在 gp-data Docker 卷中；应定期备份，并验证恢复。当前设计是单机单实例，不要复制 API 实例访问不同数据库。此版本未接入手机短信验证码、密码找回、邮件验证、精确距离、地图或后台推送；不要在宣传中承诺这些功能。
 
 ## 安装包与发布
