@@ -5,6 +5,7 @@ services:
     environment:
       DATABASE_PATH: /data/gym-partner.sqlite
       PORT: 3000
+      TRUST_PROXY_HOPS: 1
       ADMIN_TOKEN: ${ADMIN_TOKEN:?Set ADMIN_TOKEN in deploy/.env}
     volumes:
       - gp-data:/data
