@@ -1,0 +1,1 @@
+{"desc":"训练与聊天内容不开放搜索索引","rules":[{"action":"disallow","page":"*"}]}
