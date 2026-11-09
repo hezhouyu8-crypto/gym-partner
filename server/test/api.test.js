@@ -20,6 +20,13 @@ test('two users publish, invite, accept, chat; outsider, block and deletion prot
  assert.equal((await req('/invites/'+id,'PATCH',{status:'accepted'},a.token)).status,200);
  assert.equal((await req('/invites/'+id+'/messages','POST',{body:'门口集合'},b.token)).status,201);
  assert.equal((await req('/invites/'+id+'/messages','GET',undefined,a.token)).data[0].body,'门口集合');
+ const insert=db.prepare('INSERT INTO messages VALUES(?,?,?,?,?)');
+ db.transaction(()=>{for(let n=0;n<305;n++)insert.run('history-'+n,id,b.user.id,'历史消息'+n,new Date(Date.now()-600000+n).toISOString());})();
+ assert.equal((await req('/invites/'+id+'/messages','POST',{body:'最新消息'},b.token)).status,201);
+ const history=(await req('/invites/'+id+'/messages','GET',undefined,a.token)).data;
+ assert.equal(history.length,300);assert.equal(history.at(-1).body,'最新消息');
+ assert.equal(history.some(m=>m.id==='history-0'),false);
+ assert.ok(history.every((m,n)=>n===0||m.created>=history[n-1].created));
  assert.equal((await req('/workouts/'+w.data.id,'DELETE',undefined,b.token)).status,404);
  assert.equal((await req('/reports','POST',{target:a.user.id,reason:'不恰当行为'},b.token)).status,201);
  assert.equal((await req('/blocks','POST',{target:a.user.id},b.token)).status,200);
@@ -34,5 +41,17 @@ test('two users publish, invite, accept, chat; outsider, block and deletion prot
  assert.equal((await req('/me','GET',undefined,c.token)).status,401);
  assert.equal((await req('/auth/login','POST',{email:'Carol@example.com',password:'securePassword123'})).status,401);
  if(previous===undefined)delete process.env.ADMIN_TOKEN;else process.env.ADMIN_TOKEN=previous;
+ }finally{await new Promise(r=>server.close(r));db.close();}
+});
+
+test('Caddy clients have independent authentication rate limits',async()=>{
+ const {app,db}=createApp(':memory:',{trustProxyHops:1});
+ const server=app.listen(0);await new Promise(r=>server.once('listening',r));
+ const url='http://127.0.0.1:'+server.address().port;
+ const login=ip=>fetch(url+'/auth/login',{method:'POST',headers:{'Content-Type':'application/json','X-Forwarded-For':ip},body:JSON.stringify({email:'unknown@example.com',password:'wrong-password'})});
+ try{
+  for(let n=0;n<30;n++)assert.equal((await login('192.0.2.1')).status,401);
+  assert.equal((await login('192.0.2.1')).status,429);
+  assert.equal((await login('192.0.2.2')).status,401);
  }finally{await new Promise(r=>server.close(r));db.close();}
 });
